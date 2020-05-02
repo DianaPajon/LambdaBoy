@@ -1,0 +1,344 @@
+\documentclass[a4paper,10pt]{report}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[spanish]{babel}
+
+\title{
+Análisis de Lenguajes de Programación II
+}
+\author{Manuel Pajón}
+\begin{document}
+\maketitle
+\section*{Descripción del TP}
+El trabajo práctico consiste en un emulador rudimentario de Nintendo GameBoy, el objetivo pautado era un emulador estable que pueda emular Tetris, sin necesidad de emular sonido.\\
+
+
+La máquina a emular consiste en:
+\begin{itemize}
+  \item Un procesador ligeramente basado en la Zilog Z80. Emulado cási en su totalidad.
+  \item Una display LCD de 160x144. Con 4 tonos de color. El display dibuja pantalla linea por linea, originalmente 59.7 cuadros por segundo.
+  Sólamente son emulados los timers del LCD y las interrupciones. La emulación muestra el video a 40 cuadros por segundo, y obtiene la pantalla de a cuadros enteros, directamente de la memoria de video.
+  \item Un pad digital de 4 direcciones, y 4 botones (A, B, Select y Start). Emulados.
+  \item 8kb de RAM general y 8kb de RAM de video. Emulados.
+  \item Cartuchos que pueden tener ROMS de hasta 1mb, dividido en bancos de 16kb, y bancos de RAM de 8kb. El emulador sólamente soporta cartuchos de 32kb, sin RAM.
+  \item Sonido. No emulado.
+  
+\end{itemize}
+\subsection*{La CPU}
+El primer paso del emulador fue implementar la CPU, esta fue implementada suponiendo una implementación del espacio de direcciones que da la estructura AddrSpace y las funciones readMem8, readMem16, writeMem8 y writeMem16 para manejar la memoria.
+\clearpage
+Las estructuras de datos declaradas son las siguientes:
+\begin{verbatim}
+data Estado = Estado { 
+                      cpu :: !CPU,
+                      addrspace :: !AddrSpace
+                     }
+
+data CPU = CPU {
+                 a_reg :: !Word8,
+                 b_reg :: !Word8,
+                 c_reg :: !Word8,
+                 d_reg :: !Word8,
+                 e_reg :: !Word8,
+                 h_reg :: !Word8,
+                 l_reg :: !Word8,
+                 f_reg :: !Word8,
+                 pc_reg :: !Word16,
+                 sp_reg :: !Word16,
+                 ime :: !Bool,
+                 halted :: !Bool,
+                 freq :: !Int,
+                 ciclos :: !Int
+               }
+data Registro8 = A | B | C | D | E | F | H | L
+data Registro16 = AF | BC | DE | HL | SP
+type Instrucción = (CPU, AddrSpace) -> (CPU, AddrSpace)
+\end{verbatim}
+\begin{itemize}
+  \item La estructura Estado llevará el estado de la máquina. AddrSpace guarda el espacio de direcciones y los contadores para interrupciones. Originalmente, la estructura estado llevaba también los contadores, pero para simplificar la implementación posterior de las interrupciones, estos se movieron dentro de AddrSpace. Es por eso que se usa también la tupla (CPU, AddrSpace) en esta sección. Esta tupla era la implementación original del estado, y podría haber sido la implementación final, pero torpezas durante la programación hicieron que haya 2 estructuras totalmente isomorfas en la implementación final.
+  \item La estructura CPU representará el estado interno de la CPU. Los campos terminados en reg representan los registros. El campo \textbf{ime} activa o desactiva todas las interrupciones y el campo \textbf{halted} marca el estado HALT (ver seccioń \textit{Interrupciones}). El campo \textbf{freq}, por el momento no usado, da la frecuencia del procesador. Finalmente el campo \textbf{ciclos} guarda los ciclos consumidos por la última instrucción ejecutada, esto es usado para sincronizar las interrupciones.
+  \item Registro8 y Registro16 se usan para representar los registros,  las funciones que uso para representar las instrucciones pueden tomar uno de estos elementos como argumento.
+  \item Finalmente, Instrucción representa las instrucciones del procesador.
+\end{itemize}
+El uso (y posible abuso) de campos estrictos en las estructuras consigue evitar stack overflows, y controlar el crecimiento del programa en memoria. Los uso porque el proceso de emulación se beneficia muy poco de la evaluación lazy, siendo incluso perjudicado en varias situaciones. Por ejemplo, si una sección de código modifica constantemente un registro del procesador, pero no lo lee, esto generaría mucho stack innecesario, para un dato que en forma normal sería sólamente 1 byte. Como ademas, prácticamente todas las operaciones realizadas son simples, el costo de evaluar en cada paso es ínfimo.
+La interfaz para manejar esta estructura está formada principalmente por las siguientes funciones:
+\begin{itemize}
+  \item \begin{verbatim}
+readPC :: (CPU, AddrSpace) -> (Word8, (CPU, AddrSpace))
+  \end{verbatim}
+  Lee el byte apuntado por el program counter, y lo incrementa.
+  \item \begin{verbatim}
+flagC, flagO, flagH, flagZ :: CPU -> Bool
+writeFlags :: Maybe Bool -> 
+              Maybe Bool -> 
+              Maybe Bool -> 
+              Maybe Bool -> 
+              CPU -> CPU
+        \end{verbatim}
+    Para manejar los flags.
+   \item \begin{verbatim}
+af_reg,bc_reg,de_reg,hl_reg :: CPU -> Word16
+writeAF,writeBC,writeDE,writeHL :: CPU -> Word16 -> CPU
+   \end{verbatim}
+   Para manejar los registros de 16-bit
+   \item \begin{verbatim}
+escribir8 :: Registro8 -> Word8 -> CPU -> CPU
+escribir16 :: Registro16 -> CPU -> Word16 -> CPU
+leer8 :: Registro8 -> CPU -> Word8
+leer16 :: Registro16 -> CPU -> Word16
+   \end{verbatim}
+    Para manejar los registros del procesador de una forma mas general, y no tener que escribir un caso de cada instrucción por cada registro que tome como argumento.
+\end{itemize}
+\clearpage
+Hay otras funciones en el código, pero o son auxiliares de las dadas, o se usaron muy poco (y probablemente sin necesidad).
+Dada la interfaz, todas las instrucciones tienen una implementación bastante mecánica, este es el ejemplo de la instrucción ADD:\begin{verbatim}
+add_a_r :: Registro8 -> (CPU, AddrSpace) -> (CPU, AddrSpace)
+add_a_r r (cpu, ad) = let x = leer8 A cpu
+                          y = leer8 r cpu
+                          res = (x + y)
+                          zero = Just (res == 0)
+                          oper = Just False
+                          half = Just (res .&. 0x0F < x .&. 0x0F)
+                          carry = Just (res < x)
+                          cpu' = cpu{a_reg = res, ciclos = 4}
+                           in (writeFlags zero oper half carry cpu', ad)
+\end{verbatim}
+El nombre de cada instrucción esta formado por :
+\begin{itemize}
+  \item El assembly de la misma (en este caso, \textbf{add}).
+  \item Los registros fijos que tome como argumento (en este caso \textbf{a}).
+  \item Si la instrucción toma un registro variable de 8 bits, una \textbf{r}
+  \item Si la instrucción toma un registro variable de 16 bits, \textbf{rr}
+  \item Si la instrucción toma un valor directo de 8 bits, \textbf{d8}, si tiene signo \textbf{a8}.
+  \item Si la instrucción toma un valor directo de 16 bits, \textbf{d16}, si es dirección, \textbf{a16}
+  \item Si uno de los argumentos se usa como puntero, tienen una \textbf{p} delante del mismo.
+\end{itemize}
+
+Una vez implementadas las instrucciones, siendo que el gameboy acepta menos de 512 opcodes posibles, la forma mas fácil y eficiente de "parsear" el assembler, fue simplemente escribir arreglos de opcodes y usar el byte correspondiente como índice. Los opcodes, o son de un sólo byte, o son de 2 bytes, pero el primer byte es \textit{CB} (hexadecimal), luego, 2 arreglos indexados por Word8 alcanzaron para representar todos los opcodes ( \textit{instruccionesbase} y \textit{instruccionesCB})
+
+Finalmente, la función oneInstruction:\begin{verbatim}
+oneInstruction ::  Estado  -> Estado
+oneInstruction s = s{cpu = cpu', addrspace = addrspace'}
+                where  (i, s') = readPC (cpu s, addrspace s)
+                       (cpu', addrspace') = (instruccionesbase ! i) s'
+\end{verbatim}
+Ejecuta una instrucción.
+\clearpage
+\textit{Para mas información sobre las instrucciones que soporta el gameboy, y los timing de las mismas, consultar la documentación adjunta.}
+\subsection*{Cartuchos}
+El código de esta sección está en el archivo Rom.hs. La implementación de los cartuchos actual es bastante rudimentaria. El gameboy tienen siempre 2 bancos de memoria cargados
+
+La estructura de datos que guarda el cartucho es la siguiente:
+\begin{verbatim}
+data ROM = ROM { 
+                 romType :: Int,
+                 numRoms :: Int,
+                 numRams :: Int, 
+                 romBank0 :: UArray Word16 Word8,
+                 romBank1 :: UArray Word16 Word8,
+                 ramBank :: UArray Word16 Word8,
+                 romBanks :: [UArray Word16 Word8],
+                 ramBanks :: [UArray Word16 Word8]
+              }
+\end{verbatim}
+Las roms estan identificadas por un número en el byte 0147h del mismo, que indica el tipo del mismo, y la presencia o no de bancos de RAM/ROM, ese numero debería ser guardado en el campo \textbf{romType}. Los campos \textbf{numRoms} y \textbf{numRams}. El gameboy siempre mantiene el primer banco de memoria del cartucho, conocid como "Rom Bank 0", este se guarda como un arreglo de bytes en \textbf{romBank0}. El arreglo \textbf{romBank1} guarda el banco de memoria intercambiable. Si bien todavía no se implementaron las memorias externas, hay un campo para la misma, \textbf{ramBank}. Este es un arreglo regular en lugar de un diffarray, esto se explica en la implementación de AddrSpace. Finalmente las listas \textbf{romBanks} y \textbf{ramBanks}, tampoco usadas por el momento guardarían los bancos de ROM y Ram.
+
+Las funciones para manejar las ROMS son las siguientes: 
+\begin{verbatim}
+readRom :: ROM -> Word16 -> Word8
+writeRom :: ROM -> Word16 -> Word8 -> ROM
+openRom :: String -> IO ROM
+\end{verbatim}
+\begin{itemize}
+  \item \textbf{readRom} Lee un byte de la ROM, toma como argumento la ROM y la dirección (en el espacio del gameboy) del byte
+  \item \textbf{writeRom} serviría para escribir un byte de la ROM, esta funcion, cuando se le pasan ciertas direcciones no escribible, también sería la que ejecute los cambios de banco de memoria. Pero eso aún no está implementado.
+  \item \textbf{openRom} lee una rom dado un nombre de archivo
+\end{itemize}
+\subsection*{Espacio de direcciones}
+El espacio de direcciones del GameBoy incluye mas que sólamente memoria. En el mismo estan mapeados:
+\begin{itemize}
+  \item Las ROMs.
+  \item Las memorias internas y externas (de video y de uso general).
+  \item Los registros de Entrada/Salida
+\end{itemize}
+La estructura usada para el espacio de direcciones es la siguiente:
+\begin{verbatim}
+data AddrSpace = AddrSpace {
+                             rom :: !ROM,
+                             iram :: !(UArray Word16 Word8),
+                             zram :: !(UArray Word16 Word8),
+                             tilesets :: !(UArray Word16 Word8),
+                             tilemaps :: !(UArray Word16 Word8), 
+                             oam :: !(UArray Word16 Word8),
+                             arrowpad :: !Word8,
+                             buttonpad :: !Word8,
+                             ff00 :: !Word8,
+                             ff0f :: !Word8,
+                             ff04 :: !Word8,
+                             ff05 :: !Word8,
+                             ff06 :: !Word8,
+                             ff07 :: !Word8,
+                             ff40 :: !Word8,
+                             ff41 :: !Word8,
+                             ff42 :: !Word8,
+                             ff43 :: !Word8,
+                             ff44 :: !Word8,
+                             ff45 :: !Word8,
+                             ff46 :: !Word8,
+                             ff47 :: !Word8,
+                             ff48 :: !Word8,
+                             ff49 :: !Word8,
+                             ff4a :: !Word8,
+                             ff4b :: !Word8,
+                             ffff :: !Word8,
+                             lcdTicks :: !Int, 
+                             divTicks :: !Int,
+                             timerTicks :: !Int
+                           }
+
+\end{verbatim}
+\begin{itemize}
+  \item \textbf{rom} guarda la ROM.
+  \item \textbf{iram} y \textbf{zram} son las memorias internas de uso general
+  \item \textbf{tilesets}, \textbf{tilemaps} y \textbf{oam} forman la memoria de video, para mas detalles ver la sección correspondiente
+  \item \textbf{arrowpad} y \textbf{buttonpad} dan el estado de los botones, consultar la documentación adjunta (pandocs) para mas detalles sobre su funcionamiento.
+  \item Los campos con nombres del tipo \textbf{ffXX} corresponden a los puertos de IO, cada uno está nombrado según su dirección.
+  \item Los campos \textbf{lcdTicks}, \textbf{divTicks} y \textbf{timerTicks} cuentan los ticks del procesador faltantes para un cambio en los timers (timerTicks y divTicks) o en el estado del lcd (lcdTicks)
+\end{itemize}
+Las funciones que manejan esta estructura son, principalmente:
+\begin{itemize}
+  \item\begin{verbatim}
+readMem8 :: AddrSpace -> Word16 -> Word8
+readMem16 :: AddrSpace -> Word16 -> Word16
+       \end{verbatim}
+       Para leer una dirección dada.
+         \item\begin{verbatim}
+writeMem8 :: AddrSpace -> Word16 -> Word8 -> AddrSpace
+writeMem16 :: AddrSpace -> Word16 -> Word16 -> AddrSpace
+       \end{verbatim}
+       \textbf{writeMem8} emula la \textit{escritura a memoria} del gameboy. Muchas acciones de IO en el gameboy se realizan mediante esta función, ya sea el cambio de bancos de memoria, el reseteo de timers, el manejo del registro del pad, la copia mediante DMA a la memoria de sprites, etc. writeMem8 serviría para emular todo lo que en el gameboy se realiza mediante una escritura a memoria. \textbf{writeMem16}, implementada mediante writeMem8, escribe 2 bytes consecutivos (y se implementa de esa manera).
+\end{itemize}
+La implementación original de la memoria, usaba tipos DiffUArray, que supuestamente permitían actualizaciones en tiempo constante, aún así el emulador tenía problemas para alcanzar velocidades jugables. Si bien la velocidad no era el principal objetivo del emulador, era imposible correr Tetris al 100\% en algunas computadoras relativamente nuevas. El uso de Arrays regulares de Haskell sorpresivamente solucionó este problema, resultando en una enorme ganancia de performance.\\
+
+\textit{Para mas detalle, en la documentación adjunta (pandocs) puede encontrarse un mapa de la memoria del GameBoy.}
+\clearpage
+\subsection*{Timers e Interrupts}
+Esta parte del emulador se encarga de manejar los timers del gameboy, los tiempos del LCD y las interrupciones.El código de esta sección se encuentra en el archivo \textit{Interrupt.hs}
+\subsubsection*{Timers}
+El gameboy cuenta con 2 timers internos, el \textbf{divider}, que se incrementa de a 1 a una frecuencia fija de 16384Hz, cuando llega a 255 se reinicia a 0. El otro timer, \textbf{timer} se incrementa de a 1 a una frecuencia configurable (4096Hz, 262144Hz, 65536Hz o 16384Hz), y al llegar a 255 se resetea a un valor configurable, y pide una interrupcion. Escribir a cualquiera de los registros de estos timers los resetea a 0.
+Para manejar los timers se usa la función \textbf{timerTick}
+\subsubsection*{LCD}
+El LCD tiene 4 estados posibles, el ciclo entre estos esta especificado en los pandocs, cuando entra en el estado 1 (VBlank), se pide una interrupción. Tambien se pueden programar interrupciones cada vez que el LCD entre en un estado específico, o dibuje una linea dada. También hay un registro que marca la linea que la pantalla esta dibujando actualmente. Para emular los timers del LCD se usa la funcíon \textbf{lcdTick}.
+\subsubsection*{Interrupciones}
+Hay 5 interrupciones en el gameboy, cada una de estas tiene un flag para activar o desactivar en la dirección \textbf{FFFFh} y un flag para pedir la interrupcion, en el registro \textbf{FF0Fh}. Además hay un flag maestro para activar/desactivar interrupciones. Despues de ejecutar una instrucción, el procesador va a chequear las flagas de cada interrupción, en orden, y si alguna es ejecutable, va a saltar al interrupt handler correspondiente. Estos estan siempre en una posición fija de la memoria. Las interrupciones son manejadas por la función \textbf{interrupt}\\
+
+Finalmente, el proceso de emulación se completa con la siguientes funciones:
+
+\begin{verbatim}
+oneTick =  lcdTick . timerTick
+run estado = if halted (cpu estado)
+                then interrupt $ oneTick estado
+                else interrupt $ oneTick $ oneInstruction estado
+\end{verbatim} 
+
+El procesador tiene un estado de \textit{halt} en el cual no ejecuta instrucciones, pero los timers siguen corriendo y, cuando corresponde, se ejecutan las interrupciones. La función \textbf{run} completa el paso de emulación, dada esta función, el emulador simplemente va a ejecutar esa funcion hasta completar un frame, mostrar el frame, actualizar los pads y repetir el proceso. La funcion:
+\begin{verbatim}
+step :: Int -> (Word8, Word8) -> Bool ->  Estado -> Estado
+\end{verbatim}
+Toma la cantidad \textit{n} de ciclos a ejecutar, un estado para el pad, un valor booleano que indica si hay que realizar la interrupción del Pad o no, y devuelve el estado luego \textit{n} ciclos. El main llamará constantemente a esta función.\\
+
+\textit{La informacion exacta sobre el LCD y los Timers se encuentra en los pandocs.}
+\subsection*{Video}
+Esta sección explica como funciona el display del GameBoy, y como el emulador muestra imagen. Esta sección se refiere al código en Render.hs
+
+El gameboy no mantiene un framebuffer en memoria. En cambio, el controlador de video arma la pantalla en tres niveles, a partir de pequeñas imagenes de 8x8 llamadas \textit{tiles}. Los niveles de la pantalla son:
+\begin{itemize}
+  \item El \textit{background} es un mapa de $256\times256$ pixels ($32\times32$ tiles), del cual se muestran $160\times144$ pixels. Hy 2 registros (FF42 y FF43) que marcan la posición de la  pantalla sobre el background.
+  \item Los \textit{sprites} son pequeñas imágenes formadas por 1 o 2 tiles, que pueden aparecer por encima o debajo del background segun sus propiedades. La información de los mismos está en una parte de la memoria llamada \textit{Object Attribute Memory} (OAM). Se implementarón sólamente los sprites de $8\times8$ pixels (1 tile).
+  \item La ventana (\textit{window}), es una imagen que aparece por encima de los sprites. Se usa para mostrar indicadores de juego, como vidas, puntaje y otra información. No siempre es usada, y no está implementada.
+\end{itemize}
+
+Los tipos que usa el emulador para armar la pantalla son los siguientes:
+\begin{itemize}
+  \item \begin{verbatim}type Tile = UA.UArray (Word8, Word8) Word8\end{verbatim} Usado para guardar un tile
+  \item \begin{verbatim}type Tileset = Array Int Tile\end{verbatim} Es un arreglo lazy que guarda todos los tiles en memoria.
+  \item \begin{verbatim}type Background = Array (Word8, Word8) Tile\end{verbatim} Representa el fondo como arreglo de tiles
+  \item \begin{verbatim}type Screen = IOUArray (Word8, Word8) Word32 \end{verbatim} Este tipo es la representación final de la pantalla, como un arreglo de pixels RGB
+\end{itemize}
+
+Para obtener los tiles de la memoria, se usa la funcioń:
+\begin{verbatim}
+tiles :: AddrSpace -> Tileset
+\end{verbatim}
+
+Teniendo los tiles, el background se arma con las funciones:
+\begin{verbatim}
+armarBackground :: AddrSpace -> Tileset -> Background
+getPixel :: Word8 ->  Word8 -> Background -> Word8
+renderBackground :: AddrSpace -> Tileset -> IO Screen
+\end{verbatim}
+\textbf{armarBackground} toma un Tileset, y arma un arreglo lazy de $32\times32$ Tiles (\textit{Background}). \textbf{getPixel} toma ese arreglo, la posición de la pantalla sobre el background y la posición de un pixel en la pantalla, y luego devuelve el pixel correspondiente en la pantalla de la GameBoy. Esas 2 funciones son usadas por \textbf{renderBackground} para armar la primer capa de la pantalla. Además, \textit{renderBackground} lee la paleta y le aplica color a los pixeles, usando las funciones de paleta.\\
+
+La siguiente etapa es agregar los sprites. Los sprites son representados por la estructura:
+\begin{verbatim}
+data Sprite = Sprite {
+                       arriba :: Bool, 
+                       pixelarray :: Array (Int, Int) Word32
+                      }
+\end{verbatim}
+Donde \textit{arriba} indica si el sprite debe ir arriba o abajo del background, y \textit{pixelarray} es la imagen de $8\times8$ que forma el sprite.
+
+Para obtener los sprites de memoria se usa la función:
+\begin{verbatim}
+hacerSprite8 :: AddrSpace -> Tileset -> Word8 -> Maybe Sprite
+\end{verbatim}
+Esta funcion toma el tileset, el AddrSpace y un número de sprite, y devuelve ese sprite (\textit{Just sprite}), siempre que ese sprite se muestre en pantalla. Si la posición del sprite indica que está fuera de la pantalla, devuelve \textit{Nothing}. Esta función es usada por:
+\begin{verbatim}
+hacerSprites8 :: AddrSpace -> Tileset -> [Maybe Sprite]
+\end{verbatim}
+Para obtener una lista de todos los sprites, luego, teniendo esa lista, y el background, la función:
+\begin{verbatim}
+ponerSprite :: Screen -> Maybe Sprite -> IO ()
+\end{verbatim}
+Se encarga de mezclarlos con el background obtenido con \textit{renderBackground}.\\
+
+Finalmente, la función que el Main usará como interfaz para hacer la pantalla es:
+\begin{verbatim}
+makeScreen :: IORef Estado -> IO [Word32]
+\end{verbatim}
+La lista que devuelve no es mas que el arreglo de tipo Screen desempaquetado.\\
+
+\textit{Para mas información sobre el sistema de video del gameboy, consultar la documentación adjunta (pandocs).}
+\subsection*{Main}
+Teniendo ya las herramientas necesarias, sólo queda armar el programa. Esta funcioń se refiere al código de ProyectoBoy.hs\\
+
+Para manejar el flujo del programa se usa GLUT, con callbacks para manejar los cuadros de emulacion y la información de rendimiento que imprime el emulador. El programa abre la ROM usando \textit{openRom}.\\
+
+Se mantienen 3 ioRefs, \textit{estado}, \textit{rendimiento} y \textit{pad}.\begin{itemize}
+\item La ioRef \textit{estado} sirve para llevar el estado cuadro a cuadro. Guarda inicialmente el estado devuelto por \textit{openRom} y es actualizada por la función \textit{ciclar}, que es llamada con un timer fijo.\\
+\item\textit{Rendimiento} lleva la cantidad de frames de emulación y frames de video mostrados, una vez por segundo la función \textit{bench} imprime esa informacioń y la resetea a 0.\\
+\item\textit{Pad} mantiene el estado del pad, hay una función llamada \textit{actualizarPad} para actualizarlos, esta funcion es llamada por el keyboardMouseCallback de GLUT.\end{itemize}
+Finalmente, \textit{display}, llamada por \textit{ciclar} es la función que extrae la pantalla del estado y usa \textit{drawPixels }para actualizar la imagen.
+\clearpage
+\section*{Conclusiones}
+El emulador cumple con lo pactado, si bien la emulación está aún incompleta, se puede jugar Tetris al 100\% en cualquier máquina moderna. Reestructurando ciertas cosas podría ser mas rápido, por ejemplo, los tiles son guardados como estarían en la memoria del GameBoy, pero para obtener los pixels de los mismos, son necesarias varias operaciones de bits, podrían realizarse cuando se escriban o lean, y guardarlos internamente como imágenes. Otro detalle es que el render usa openGL para mostrar frames enteros, se podría aprovechar para formar la imagen, armando los tiles como superficies de openGL. Analizar el orden de las guardas de las funciones para leer y escribir la memoría tambíen podría optimizar el emulador. También podría ser mas eficiente guardar los flags de la CPU como 4 booleanos, y construir el registro f cuando haga falta.\\
+
+La claridad del código es bastante buena, por lo menos a mi criterio (que es obviamente poco confiable por ser quien escribió el código). Hubo problemas para mantener las abstracciones que intenté plantear inicialmente (\textit{AddrSpace}  para la memoria, \textit{CPU} para la CPU y Estado englobando ambos junto con lo necesario para la sincronización), ese objetivo se fue deformando al tener que apurar el proyecto para que esté listo a tiempo. El primer paso para expandir el proyecto debería ser una limpieza del código, corrigiendo varias cosas, y buscando mas consistencia.
+\section*{Fuentes consultadas}
+\begin{itemize}
+  \item NoCash Pandocs:\\ http://nocash.emubase.de/pandocs.htm\\http://web.archive.org/web/20110718190935/http://nocash.emubase.de/pandocs.htm\\ (el sitio principal suele estar caído)
+  \item GameBoy Opcode Map:\\ http://www.pastraiser.com/cpu/gameboy/gameboy\_opcodes.html
+  \item GameBoy Assembly Commands:\\ http://marc.rawer.de/Gameboy/Docs/Instr.txt
+  \item Gameboy Emulation in JavaScript, por Imran Nazar:\\ http://imrannazar.com/GameBoy-Emulation-in-JavaScript:-The-CPU
+  \item Emulating the GameBoy:\\ http://www.codeslinger.co.uk/pages/projects/gameboy.html
+\end{itemize}
+\small \textit{(es dificil identificar a los autores de esas fuentes, la mayoría son anónimos, o usan nombres como no\$)}
+\section*{Emuladores Consultados}
+\begin{itemize}
+  \item jsGB de Imran Nazar:\\ https://github.com/Two9A/jsGB
+  \item OmegaGB de Bit Connor:\\ https://github.com/bitc/omegagb \\ \textit{Emulador de gameboy en Haskell, pero nunca completado. No ejecuta ningún juego, aparentemente abandonado}
+  \item jsGB de Pedro Ladaria:\\ http://www.codebase.es/jsgb/?v=0.02 \\ \textit{Tiene un excelente debugger que fue muy util a la hora de testear.}
+  \item JavaBoy de Neil Millstone:\\ http://www.millstone.demon.co.uk/download/javaboy/download.htm
+\end{itemize}
+\end{document} 

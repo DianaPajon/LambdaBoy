@@ -1,0 +1,13 @@
+Name:                LambdaBoy
+Version:             0.0
+Description:         Mal emulador de GameBoy
+License:             Pendiente
+Author:              Diana Pajón
+Maintainer:          diana.pajon.16@gmail.com
+Build-Type:          Simple
+Cabal-Version:       >=1.2
+
+Executable ProyectoBoy
+  Main-is:           LambdaBoy.hs
+  Build-Depends:     base == 4.*, GLUT, OpenGL >= 2.4,  array, bytestring
+  ghc-options: -Wall -O2
