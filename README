@@ -3,7 +3,7 @@ LambdaBoy - A GameBoy emulator written in Haskell
 I wrote this emulator as a functional programming assignment in college, back in 2012.
 It's kinda badly written, it needs a rewrite, it was my first "big" project.
 
-The important part about it, it's that it WORKS, it is a working emulator for SOME 256k roms 
+The important part about it, it's that it WORKS, it is a working emulator WRITTEN IN HASKELL for SOME 256k roms 
 (tetris, and dr mario working so far).
 
 Use stack to build.
